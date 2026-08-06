@@ -31,18 +31,33 @@ function maxOptraUrl(path) {
   return `${baseUrl}${path}`;
 }
 
-function itemCount(value) {
+function itemsFrom(value) {
   if (Array.isArray(value)) {
-    return value.length;
+    return value;
   }
 
   for (const key of ["items", "content", "data", "distributionCentres"]) {
     if (Array.isArray(value?.[key])) {
-      return value[key].length;
+      return value[key];
     }
   }
 
-  return null;
+  return [];
+}
+
+function safeDistributionCentre(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  return {
+    reference:
+      value.reference ??
+      value.referenceNumber ??
+      value.distributionCentreReference ??
+      null,
+    name: value.name ?? value.description ?? null
+  };
 }
 
 app.get("/", async () => {
@@ -130,11 +145,13 @@ app.get("/health/maxoptra", async (request, reply) => {
     }
 
     const body = await response.json();
+    const distributionCentres = itemsFrom(body);
 
     return {
       ok: true,
       maxoptra: "connected",
-      distributionCentres: itemCount(body),
+      distributionCentres: distributionCentres.length,
+      distributionCentre: safeDistributionCentre(distributionCentres[0]),
       sendEnabled: settings.sendEnabled
     };
   } catch (error) {
