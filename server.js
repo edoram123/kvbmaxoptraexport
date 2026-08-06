@@ -32,6 +32,7 @@ const CSV_COLUMNS = [
 ];
 
 let shopifyAccessToken = null;
+let exportWorkerBusy = false;
 
 const app = Fastify({
   logger: true
@@ -546,6 +547,212 @@ function maxOptraUrl(path) {
   return `${baseUrl}${path}`;
 }
 
+function maxOptraHeaders() {
+  return {
+    Accept: "application/json",
+    Authorization: `Bearer ${process.env.MAXOPTRA_API_KEY}`,
+    "Content-Type": "application/json"
+  };
+}
+
+function maxOptraOrderPayload(row) {
+  const contactPerson = [row.first_name, row.customer_location_name]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+
+  return {
+    referenceNumber: row.order_reference,
+    distributionCentreReference: row.distribution_centre_reference,
+    task: "DELIVERY",
+    priority: "NORMAL",
+    clientName: row.customer_location_name || contactPerson || row.order_reference,
+    contactPerson: contactPerson || row.customer_location_name || undefined,
+    contactNumber: row.contact_number || undefined,
+    contactEmail: row.contact_email || undefined,
+    customerLocation: {
+      name: row.customer_location_name || contactPerson || row.order_reference,
+      address: row.customer_location_address
+    }
+  };
+}
+
+async function responseBody(response) {
+  const responseText = await response.text();
+
+  if (!responseText) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch {
+    return { raw: responseText };
+  }
+}
+
+function maxOptraOrderDetails(body) {
+  return body?.data && typeof body.data === "object" ? body.data : body;
+}
+
+async function claimNextExport() {
+  const result = await pool.query(`
+    UPDATE maxoptra_export_queue
+    SET status = 'processing',
+        attempt_count = attempt_count + 1,
+        processing_started_at = NOW(),
+        updated_at = NOW(),
+        last_error = NULL
+    WHERE id = (
+      SELECT id
+      FROM maxoptra_export_queue
+      WHERE status = 'pending'
+      ORDER BY requested_at, id
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+    )
+    RETURNING *
+  `);
+
+  return result.rows[0] || null;
+}
+
+async function saveExportResult(id, values) {
+  await pool.query(
+    `UPDATE maxoptra_export_queue
+     SET status = $2,
+         api_payload = COALESCE($3::jsonb, api_payload),
+         maxoptra_http_status = $4,
+         maxoptra_response = COALESCE($5::jsonb, maxoptra_response),
+         last_error = $6,
+         sent_at = CASE WHEN $7 THEN COALESCE(sent_at, NOW()) ELSE sent_at END,
+         confirmed_at = CASE WHEN $8 THEN NOW() ELSE confirmed_at END,
+         completed_at = CASE WHEN $9 THEN NOW() ELSE completed_at END,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [
+      id,
+      values.status,
+      values.payload ? JSON.stringify(values.payload) : null,
+      values.httpStatus ?? null,
+      values.response ? JSON.stringify(values.response) : null,
+      values.error || null,
+      Boolean(values.sent),
+      Boolean(values.confirmed),
+      Boolean(values.completed)
+    ]
+  );
+}
+
+async function fetchMaxOptraOrder(orderReference) {
+  const response = await fetch(
+    maxOptraUrl(`/orders/${encodeURIComponent(orderReference)}`),
+    {
+      method: "GET",
+      headers: maxOptraHeaders(),
+      signal: AbortSignal.timeout(20000)
+    }
+  );
+
+  return {
+    response,
+    body: await responseBody(response)
+  };
+}
+
+async function processExport(row) {
+  const payload = maxOptraOrderPayload(row);
+
+  await pool.query(
+    `UPDATE maxoptra_export_queue
+     SET api_payload = $2::jsonb, updated_at = NOW()
+     WHERE id = $1`,
+    [row.id, JSON.stringify(payload)]
+  );
+
+  const createResponse = await fetch(maxOptraUrl("/orders"), {
+    method: "POST",
+    headers: maxOptraHeaders(),
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30000)
+  });
+  const createBody = await responseBody(createResponse);
+  const duplicate = createResponse.status === 409;
+
+  if (!createResponse.ok && !duplicate) {
+    await saveExportResult(row.id, {
+      status: "failed",
+      payload,
+      httpStatus: createResponse.status,
+      response: createBody,
+      error: `MaxOptra rejected the order with HTTP ${createResponse.status}`,
+      completed: true
+    });
+    return;
+  }
+
+  const lookup = await fetchMaxOptraOrder(row.order_reference);
+
+  if (!lookup.response.ok) {
+    await saveExportResult(row.id, {
+      status: "sent",
+      payload,
+      httpStatus: createResponse.status,
+      response: {
+        create: createBody,
+        verification: lookup.body
+      },
+      error: `Order was sent but verification failed with HTTP ${lookup.response.status}`,
+      sent: !duplicate,
+      completed: true
+    });
+    return;
+  }
+
+  const details = maxOptraOrderDetails(lookup.body);
+  const expectedTerritory = upper(row.territory);
+  const actualTerritory = upper(details?.territoryReference);
+  const territoryMatches = expectedTerritory && actualTerritory === expectedTerritory;
+  const resultStatus = duplicate ? "already_present" : territoryMatches ? "confirmed" : "sent";
+  const territoryMessage = territoryMatches
+    ? null
+    : `Expected territory ${expectedTerritory || "(none)"}; MaxOptra returned ${actualTerritory || "(none)"}`;
+
+  await saveExportResult(row.id, {
+    status: resultStatus,
+    payload,
+    httpStatus: createResponse.status,
+    response: {
+      create: createBody,
+      verification: lookup.body
+    },
+    error: territoryMessage,
+    sent: !duplicate,
+    confirmed: territoryMatches,
+    completed: true
+  });
+}
+
+async function runExportWorker() {
+  if (exportWorkerBusy || !maxOptraSettings().sendEnabled) {
+    return;
+  }
+
+  exportWorkerBusy = true;
+
+  try {
+    const row = await claimNextExport();
+
+    if (row) {
+      await processExport(row);
+    }
+  } catch (error) {
+    app.log.error(error, "MaxOptra export worker failed");
+  } finally {
+    exportWorkerBusy = false;
+  }
+}
+
 function itemsFrom(value) {
   if (Array.isArray(value)) {
     return value;
@@ -772,6 +979,10 @@ app.post(
 app.addHook("onClose", async () => {
   await pool.end();
 });
+
+const exportWorkerTimer = setInterval(runExportWorker, 5000);
+exportWorkerTimer.unref();
+runExportWorker();
 
 const port = Number(process.env.PORT || 3000);
 
