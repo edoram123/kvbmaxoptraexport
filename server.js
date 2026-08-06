@@ -21,6 +21,30 @@ function maxOptraSettings() {
   };
 }
 
+function maxOptraUrl(path) {
+  const baseUrl = process.env.MAXOPTRA_BASE_URL?.replace(/\/$/, "");
+
+  if (!baseUrl) {
+    throw new Error("MAXOPTRA_BASE_URL is not configured");
+  }
+
+  return `${baseUrl}${path}`;
+}
+
+function itemCount(value) {
+  if (Array.isArray(value)) {
+    return value.length;
+  }
+
+  for (const key of ["items", "content", "data", "distributionCentres"]) {
+    if (Array.isArray(value?.[key])) {
+      return value[key].length;
+    }
+  }
+
+  return null;
+}
+
 app.get("/", async () => {
   return {
     message: "KVB MaxOptra export service is running",
@@ -68,6 +92,57 @@ app.get("/health", async (request, reply) => {
       ok: false,
       database: "disconnected",
       error: "Database health check failed"
+    });
+  }
+});
+
+app.get("/health/maxoptra", async (request, reply) => {
+  const settings = maxOptraSettings();
+
+  if (!settings.configured) {
+    return reply.code(503).send({
+      ok: false,
+      maxoptra: "not configured"
+    });
+  }
+
+  try {
+    const response = await fetch(maxOptraUrl("/distributionCentres"), {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${process.env.MAXOPTRA_API_KEY}`
+      },
+      signal: AbortSignal.timeout(15000)
+    });
+
+    if (!response.ok) {
+      request.log.error(
+        { statusCode: response.status },
+        "MaxOptra connection check was rejected"
+      );
+
+      return reply.code(502).send({
+        ok: false,
+        maxoptra: "connection failed",
+        statusCode: response.status
+      });
+    }
+
+    const body = await response.json();
+
+    return {
+      ok: true,
+      maxoptra: "connected",
+      distributionCentres: itemCount(body),
+      sendEnabled: settings.sendEnabled
+    };
+  } catch (error) {
+    request.log.error(error, "MaxOptra connection check failed");
+
+    return reply.code(502).send({
+      ok: false,
+      maxoptra: "connection failed"
     });
   }
 });
