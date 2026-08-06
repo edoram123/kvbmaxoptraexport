@@ -1,4 +1,9 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomUUID,
+  timingSafeEqual
+} from "node:crypto";
 import Fastify from "fastify";
 import pg from "pg";
 
@@ -160,6 +165,11 @@ async function requireShopifySession(request, reply) {
     ) {
       throw new Error("Invalid token");
     }
+
+    request.shopifySession = {
+      shop,
+      userId: claims.sub == null ? null : String(claims.sub)
+    };
   } catch {
     return reply
       .header("X-Shopify-Retry-Invalid-Session-Request", "1")
@@ -184,6 +194,11 @@ function text(value) {
 
 function upper(value) {
   return text(value).toUpperCase();
+}
+
+function numericShopifyId(gid) {
+  const match = String(gid || "").match(/\/(\d+)$/);
+  return match ? match[1] : null;
 }
 
 function formatUkPostcode(value) {
@@ -252,6 +267,8 @@ async function fetchOrdersById(orderIds) {
             email
             phone
             customer {
+              id
+              legacyResourceId
               firstName
               lastName
               email
@@ -287,6 +304,224 @@ async function fetchOrdersById(orderIds) {
   }
 
   return orders;
+}
+
+async function prepareOrders(orderIds) {
+  const currentOrders = await fetchOrdersById(orderIds);
+  const orders = [];
+  const errors = [];
+
+  for (const orderId of orderIds) {
+    const order = currentOrders.get(orderId);
+
+    if (!order) {
+      errors.push({ order_id: orderId, error: "Shopify order could not be found" });
+      continue;
+    }
+
+    if (!order.fulfillmentOrders.nodes.some((item) => item.status === "IN_PROGRESS")) {
+      errors.push({
+        order_id: orderId,
+        order_name: order.name,
+        error: "Order is no longer In Progress"
+      });
+      continue;
+    }
+
+    const preview = previewRow(order);
+
+    if (!preview.postcode) {
+      errors.push({
+        order_id: orderId,
+        order_name: order.name,
+        error: "A valid UK delivery postcode is required"
+      });
+      continue;
+    }
+
+    if (!preview.routeCode) {
+      errors.push({
+        order_id: orderId,
+        order_name: order.name,
+        error: "A route assignment is required"
+      });
+      continue;
+    }
+
+    orders.push({
+      order_id: order.id,
+      order_numeric_id: String(
+        order.legacyResourceId || numericShopifyId(order.id) || ""
+      ) || null,
+      customer_id: order.customer
+        ? String(
+          order.customer.legacyResourceId ||
+          numericShopifyId(order.customer.id) ||
+          ""
+        ) || null
+        : null,
+      fulfillment_order_ids: order.fulfillmentOrders.nodes
+        .filter((item) => item.status === "IN_PROGRESS")
+        .map((item) => item.id),
+      csv: preview.row
+    });
+  }
+
+  return { orders, errors };
+}
+
+function validateOrderIds(value) {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  const orderIds = Array.from(new Set(value));
+
+  if (
+    orderIds.length === 0 ||
+    orderIds.length > PREVIEW_LIMIT ||
+    orderIds.some(
+      (orderId) =>
+        typeof orderId !== "string" ||
+        !/^gid:\/\/shopify\/Order\/\d+$/.test(orderId)
+    )
+  ) {
+    return null;
+  }
+
+  return orderIds;
+}
+
+function payloadHash(order, distributionCentreReference) {
+  return createHash("sha256")
+    .update(JSON.stringify({
+      shopifyOrderId: order.order_id,
+      distributionCentreReference,
+      csv: order.csv
+    }))
+    .digest("hex");
+}
+
+async function queueOrders(orders, session) {
+  const distributionCentreReference =
+    process.env.MAXOPTRA_DISTRIBUTION_CENTRE_REFERENCE;
+  const batchId = randomUUID();
+  const client = await pool.connect();
+  const queued = [];
+  const alreadyQueued = [];
+
+  try {
+    await client.query("BEGIN");
+
+    for (const order of orders) {
+      const row = order.csv;
+      const hash = payloadHash(order, distributionCentreReference);
+
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        [hash]
+      );
+
+      const existing = await client.query(
+        `SELECT id
+         FROM maxoptra_export_queue
+         WHERE shop_domain = $1
+           AND shopify_order_id = $2
+           AND payload_hash = $3
+           AND status IN (
+             'pending', 'processing', 'sent', 'confirmed', 'already_present'
+           )
+         ORDER BY id DESC
+         LIMIT 1`,
+        [session.shop, order.order_id, hash]
+      );
+
+      if (existing.rowCount) {
+        alreadyQueued.push({
+          queue_id: existing.rows[0].id,
+          order_id: order.order_id,
+          order_reference: row.orderReference
+        });
+        continue;
+      }
+
+      const result = await client.query(
+        `INSERT INTO maxoptra_export_queue (
+           batch_id,
+           shop_domain,
+           shopify_order_id,
+           shopify_order_numeric_id,
+           customer_id,
+           requested_by_shopify_user_id,
+           order_reference,
+           contact_email,
+           customer_location_name,
+           first_name,
+           address_1,
+           address_2,
+           customer_location_address,
+           address_3,
+           town,
+           postcode,
+           territory,
+           contact_number,
+           bbox_inc,
+           column45,
+           unique_reference,
+           distribution_centre_reference,
+           csv_row,
+           api_payload,
+           payload_hash,
+           status
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+           $11, $12, $13, $14, $15, $16, $17, $18, $19,
+           $20, $21, $22, $23::jsonb, NULL, $24, 'pending'
+         )
+         RETURNING id`,
+        [
+          batchId,
+          session.shop,
+          order.order_id,
+          order.order_numeric_id,
+          order.customer_id,
+          session.userId,
+          row.orderReference,
+          row.contactEmail || null,
+          row.customerLocationName || null,
+          row.FIRST_NAME || null,
+          row.ADD_1 || null,
+          row.ADD_2 || null,
+          row.customerLocationAddress || null,
+          row.ADD_3 || null,
+          row.TOWN || null,
+          row.POSTCODE || null,
+          row.Territory || null,
+          row.contactNumber || null,
+          Number(row["BBOX-INC"]) || 0,
+          row.Column45 || null,
+          row.UNIQUE || null,
+          distributionCentreReference,
+          JSON.stringify(row),
+          hash
+        ]
+      );
+
+      queued.push({
+        queue_id: result.rows[0].id,
+        order_id: order.order_id,
+        order_reference: row.orderReference
+      });
+    }
+
+    await client.query("COMMIT");
+    return { batchId, queued, alreadyQueued };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 function maxOptraSettings() {
@@ -462,78 +697,16 @@ app.post(
   "/api/exports/preview",
   { preHandler: requireShopifySession },
   async (request, reply) => {
-    const requestedIds = request.body?.order_ids;
+    const orderIds = validateOrderIds(request.body?.order_ids);
 
-    if (!Array.isArray(requestedIds)) {
-      return reply.code(400).send({ error: "order_ids must be an array" });
-    }
-
-    const orderIds = Array.from(new Set(requestedIds));
-
-    if (
-      orderIds.length === 0 ||
-      orderIds.length > PREVIEW_LIMIT ||
-      orderIds.some(
-        (orderId) =>
-          typeof orderId !== "string" ||
-          !/^gid:\/\/shopify\/Order\/\d+$/.test(orderId)
-      )
-    ) {
+    if (!orderIds) {
       return reply.code(400).send({
         error: `Select between 1 and ${PREVIEW_LIMIT} valid Shopify orders`
       });
     }
 
     try {
-      const currentOrders = await fetchOrdersById(orderIds);
-      const orders = [];
-      const errors = [];
-
-      for (const orderId of orderIds) {
-        const order = currentOrders.get(orderId);
-
-        if (!order) {
-          errors.push({ order_id: orderId, error: "Shopify order could not be found" });
-          continue;
-        }
-
-        if (!order.fulfillmentOrders.nodes.some((item) => item.status === "IN_PROGRESS")) {
-          errors.push({
-            order_id: orderId,
-            order_name: order.name,
-            error: "Order is no longer In Progress"
-          });
-          continue;
-        }
-
-        const preview = previewRow(order);
-
-        if (!preview.postcode) {
-          errors.push({
-            order_id: orderId,
-            order_name: order.name,
-            error: "A valid UK delivery postcode is required"
-          });
-          continue;
-        }
-
-        if (!preview.routeCode) {
-          errors.push({
-            order_id: orderId,
-            order_name: order.name,
-            error: "A route assignment is required"
-          });
-          continue;
-        }
-
-        orders.push({
-          order_id: order.id,
-          fulfillment_order_ids: order.fulfillmentOrders.nodes
-            .filter((item) => item.status === "IN_PROGRESS")
-            .map((item) => item.id),
-          csv: preview.row
-        });
-      }
+      const { orders, errors } = await prepareOrders(orderIds);
 
       return {
         preview: true,
@@ -552,6 +725,46 @@ app.post(
       return reply.code(502).send({
         error: "Unable to prepare MaxOptra export preview"
       });
+    }
+  }
+);
+
+app.post(
+  "/api/exports/queue",
+  { preHandler: requireShopifySession },
+  async (request, reply) => {
+    const orderIds = validateOrderIds(request.body?.order_ids);
+
+    if (!orderIds) {
+      return reply.code(400).send({
+        error: `Select between 1 and ${PREVIEW_LIMIT} valid Shopify orders`
+      });
+    }
+
+    if (!process.env.MAXOPTRA_DISTRIBUTION_CENTRE_REFERENCE) {
+      return reply.code(503).send({
+        error: "MAXOPTRA_DISTRIBUTION_CENTRE_REFERENCE is not configured"
+      });
+    }
+
+    try {
+      const { orders, errors } = await prepareOrders(orderIds);
+      const result = await queueOrders(orders, request.shopifySession);
+
+      return {
+        sendEnabled: maxOptraSettings().sendEnabled,
+        batch_id: result.batchId,
+        requested: orderIds.length,
+        queued: result.queued.length,
+        already_queued: result.alreadyQueued.length,
+        skipped: errors.length,
+        queue_items: result.queued,
+        already_queued_items: result.alreadyQueued,
+        errors
+      };
+    } catch (error) {
+      request.log.error(error, "Unable to queue MaxOptra export");
+      return reply.code(500).send({ error: "Unable to queue MaxOptra export" });
     }
   }
 );
