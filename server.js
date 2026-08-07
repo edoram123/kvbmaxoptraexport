@@ -930,9 +930,12 @@ function scheduleAllocations(body) {
 
   for (const shift of driverShifts) {
     const vehicleName = text(shift?.vehicleName);
+    const driverName = text(shift?.driverName);
 
     for (const run of Array.isArray(shift?.runs) ? shift.runs : []) {
-      for (const allocation of Array.isArray(run?.allocations) ? run.allocations : []) {
+      const runAllocations = Array.isArray(run?.allocations) ? run.allocations : [];
+
+      for (const allocation of runAllocations) {
         const orderReference = text(allocation?.orderReference);
         if (!orderReference) continue;
 
@@ -950,6 +953,16 @@ function scheduleAllocations(body) {
         allocations.set(orderReference, {
           maxoptra_order_reference: orderReference,
           vehicle_name: vehicleName,
+          driver_name: driverName,
+          run_reference: text(run?.reference),
+          run_number: Number.isInteger(run?.runNumber) ? run.runNumber : null,
+          stop_number: Number.isInteger(allocation?.sequenceNumber)
+            ? allocation.sequenceNumber
+            : null,
+          total_stops: runAllocations.length,
+          planned_arrival_at: allocation?.plannedArrivalTime || null,
+          planned_completion_at: allocation?.plannedCompletionTime || null,
+          status: text(allocation?.status) || null,
           conflict: false,
           last_error: null
         });
@@ -996,6 +1009,95 @@ async function loadExportMembers(shop, orderReferences) {
   }
 
   return members;
+}
+
+async function saveDeliveryOperations(
+  allocations,
+  shiftDate,
+  shop,
+  membersByReference
+) {
+  if (!allocations.length) return;
+
+  const distributionCentreReference =
+    process.env.MAXOPTRA_DISTRIBUTION_CENTRE_REFERENCE;
+  const syncedAt = new Date().toISOString();
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    for (const allocation of allocations) {
+      const members = membersByReference.get(
+        allocation.maxoptra_order_reference
+      );
+      const queueId = members?.[0]?.queue_id || null;
+
+      await client.query(
+        `INSERT INTO maxoptra_delivery_operations (
+           shop_domain,
+           shift_date,
+           distribution_centre_reference,
+           maxoptra_order_reference,
+           queue_id,
+           vehicle_name,
+           driver_name,
+           run_reference,
+           run_number,
+           stop_number,
+           total_stops,
+           planned_arrival_at,
+           planned_completion_at,
+           status,
+           last_synced_at
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+           $11, $12, $13, $14, $15
+         )
+         ON CONFLICT (
+           shop_domain,
+           shift_date,
+           maxoptra_order_reference
+         ) DO UPDATE SET
+           distribution_centre_reference = EXCLUDED.distribution_centre_reference,
+           queue_id = COALESCE(EXCLUDED.queue_id, maxoptra_delivery_operations.queue_id),
+           vehicle_name = EXCLUDED.vehicle_name,
+           driver_name = EXCLUDED.driver_name,
+           run_reference = EXCLUDED.run_reference,
+           run_number = EXCLUDED.run_number,
+           stop_number = EXCLUDED.stop_number,
+           total_stops = EXCLUDED.total_stops,
+           planned_arrival_at = EXCLUDED.planned_arrival_at,
+           planned_completion_at = EXCLUDED.planned_completion_at,
+           status = EXCLUDED.status,
+           last_synced_at = EXCLUDED.last_synced_at`,
+        [
+          shop,
+          shiftDate,
+          distributionCentreReference,
+          allocation.maxoptra_order_reference,
+          queueId,
+          allocation.vehicle_name || null,
+          allocation.driver_name || null,
+          allocation.run_reference || null,
+          allocation.run_number,
+          allocation.stop_number,
+          allocation.total_stops,
+          allocation.planned_arrival_at,
+          allocation.planned_completion_at,
+          allocation.status,
+          syncedAt
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function fetchCurrentVanNumbers(orderIds) {
@@ -1091,11 +1193,23 @@ async function listVehicleAssignments(shiftDate, shop) {
        log.assignment_result,
        log.imported_at,
        log.shopify_confirmed_at,
-       member.customer_id
+       member.customer_id,
+       operations.driver_name,
+       operations.run_number,
+       operations.stop_number,
+       operations.total_stops,
+       operations.planned_arrival_at,
+       operations.planned_completion_at,
+       operations.status,
+       operations.last_synced_at
      FROM maxoptra_vehicle_assignment_log AS log
      LEFT JOIN maxoptra_export_members AS member
        ON member.queue_id = log.queue_id
       AND member.shopify_order_id = log.shopify_order_id
+     LEFT JOIN maxoptra_delivery_operations AS operations
+       ON operations.shop_domain = log.shop_domain
+      AND operations.shift_date = log.shift_date
+      AND operations.maxoptra_order_reference = log.maxoptra_order_reference
      WHERE log.shop_domain = $1
        AND log.shift_date = $2
        AND log.shopify_order_id IS NOT NULL
@@ -1134,6 +1248,14 @@ async function listVehicleAssignments(shiftDate, shop) {
         : null,
       maxoptra_order_reference: row.maxoptra_order_reference,
       van_number: row.van_number,
+      driver_name: row.driver_name,
+      run_number: row.run_number,
+      stop_number: row.stop_number,
+      total_stops: row.total_stops,
+      planned_arrival_at: row.planned_arrival_at,
+      planned_completion_at: row.planned_completion_at,
+      status: row.status,
+      last_synced_at: row.last_synced_at,
       assignment_result: row.assignment_result,
       imported_at: row.imported_at,
       shopify_confirmed_at: row.shopify_confirmed_at
@@ -1269,6 +1391,12 @@ async function importVehicleAssignments(shiftDate, session) {
   const membersByReference = await loadExportMembers(
     session.shop,
     allocations.map((allocation) => allocation.maxoptra_order_reference)
+  );
+  await saveDeliveryOperations(
+    allocations,
+    shiftDate,
+    session.shop,
+    membersByReference
   );
   const batchId = randomUUID();
   const distributionCentreReference =
