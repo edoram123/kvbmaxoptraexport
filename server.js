@@ -197,6 +197,10 @@ function upper(value) {
   return text(value).toUpperCase();
 }
 
+function limitedText(value, maximumCharacters) {
+  return Array.from(text(value)).slice(0, maximumCharacters).join("");
+}
+
 function numericShopifyId(gid) {
   const match = String(gid || "").match(/\/(\d+)$/);
   return match ? match[1] : null;
@@ -230,6 +234,7 @@ function previewRow(order) {
   const town = upper(address.city);
   const postcode = formatUkPostcode(address.zip);
   const routeCode = upper(order.metafield?.value);
+  const customerNote = text(customer.customerNote?.value);
 
   return {
     row: {
@@ -250,7 +255,8 @@ function previewRow(order) {
       UNIQUE: email || text(order.name)
     },
     postcode,
-    routeCode
+    routeCode,
+    customerNote
   };
 }
 
@@ -274,6 +280,12 @@ async function fetchOrdersById(orderIds) {
               lastName
               email
               phone
+              customerNote: metafield(
+                namespace: "customer_fields"
+                key: "customernote"
+              ) {
+                value
+              }
             }
             shippingAddress {
               firstName
@@ -340,34 +352,7 @@ function deliveryGroupKey(order) {
     .digest("hex");
 }
 
-async function reuseSavedGroupReferences(groups, shop) {
-  if (!groups.length) return;
-
-  const result = await pool.query(
-    `SELECT DISTINCT ON (delivery_group_key)
-       delivery_group_key,
-       order_reference
-     FROM maxoptra_export_queue
-     WHERE shop_domain = $1
-       AND delivery_group_key = ANY($2::text[])
-     ORDER BY delivery_group_key, id DESC`,
-    [shop, groups.map((group) => group.delivery_group_key)]
-  );
-  const savedReferences = new Map(
-    result.rows.map((row) => [row.delivery_group_key, row.order_reference])
-  );
-
-  for (const group of groups) {
-    const orderReference =
-      savedReferences.get(group.delivery_group_key) ||
-      group.members[0].shopify_order_reference;
-
-    group.order_reference = orderReference;
-    group.csv.orderReference = orderReference;
-  }
-}
-
-async function prepareOrders(orderIds, shop) {
+async function prepareOrders(orderIds) {
   const currentOrders = await fetchOrdersById(orderIds);
   const validOrders = [];
   const errors = [];
@@ -425,6 +410,7 @@ async function prepareOrders(orderIds, shop) {
         .filter((item) => item.status === "IN_PROGRESS")
         .map((item) => item.id),
       shopify_order_reference: text(order.name),
+      customer_note: preview.customerNote,
       csv: preview.row
     });
   }
@@ -440,6 +426,7 @@ async function prepareOrders(orderIds, shop) {
         delivery_group_key: key,
         delivery_date: maxOptraOrderDate(order.csv.Territory),
         customer_id: order.customer_id,
+        customer_note: order.customer_note,
         csv: { ...order.csv },
         members: []
       };
@@ -466,9 +453,9 @@ async function prepareOrders(orderIds, shop) {
     group.shopify_order_references = group.members.map(
       (member) => member.shopify_order_reference
     );
+    group.order_reference = group.shopify_order_references.join(", ");
+    group.csv.orderReference = group.order_reference;
   }
-
-  await reuseSavedGroupReferences(orders, shop);
 
   return { orders, errors };
 }
@@ -501,6 +488,7 @@ function payloadHash(order, distributionCentreReference) {
       deliveryGroupKey: order.delivery_group_key,
       shopifyOrderIds: order.members.map((member) => member.order_id).sort(),
       distributionCentreReference,
+      customerNote: order.customer_note,
       csv: order.csv
     }))
     .digest("hex");
@@ -570,6 +558,7 @@ async function queueOrders(orders, session) {
            bbox_inc,
            column45,
            unique_reference,
+           customer_note,
            distribution_centre_reference,
            csv_row,
            api_payload,
@@ -580,7 +569,7 @@ async function queueOrders(orders, session) {
          ) VALUES (
            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
            $11, $12, $13, $14, $15, $16, $17, $18, $19,
-           $20, $21, $22, $23::jsonb, NULL, $24, $25, $26, 'pending'
+           $20, $21, $22, $23, $24::jsonb, NULL, $25, $26, $27, 'pending'
          )
          RETURNING id`,
         [
@@ -605,6 +594,7 @@ async function queueOrders(orders, session) {
           Number(row["BBOX-INC"]) || 0,
           row.Column45 || null,
           row.UNIQUE || null,
+          order.customer_note || null,
           distributionCentreReference,
           JSON.stringify(row),
           hash,
@@ -723,7 +713,7 @@ function maxOptraOrderDate(routeCode) {
   return date.toISOString().slice(0, 10);
 }
 
-function maxOptraOrderPayload(row, shopifyOrderReferences = []) {
+function maxOptraOrderPayload(row) {
   const contactPerson = [row.first_name, row.customer_location_name]
     .filter(Boolean)
     .join(" ")
@@ -734,9 +724,7 @@ function maxOptraOrderPayload(row, shopifyOrderReferences = []) {
     distributionCentreReference: row.distribution_centre_reference,
     task: "DELIVERY",
     priority: "NORMAL",
-    additionalInstructions: shopifyOrderReferences.length
-      ? `Shopify orders: ${shopifyOrderReferences.join(", ")}`.slice(0, 500)
-      : undefined,
+    additionalInstructions: limitedText(row.customer_note, 500) || undefined,
     orderDate: maxOptraOrderDate(row.territory),
     clientName: row.customer_location_name || contactPerson || row.order_reference,
     contactPerson: contactPerson || row.customer_location_name || undefined,
@@ -831,17 +819,7 @@ async function fetchMaxOptraOrder(orderReference) {
 }
 
 async function processExport(row) {
-  const members = await pool.query(
-    `SELECT shopify_order_reference
-     FROM maxoptra_export_members
-     WHERE queue_id = $1
-     ORDER BY shopify_order_reference`,
-    [row.id]
-  );
-  const payload = maxOptraOrderPayload(
-    row,
-    members.rows.map((member) => member.shopify_order_reference)
-  );
+  const payload = maxOptraOrderPayload(row);
 
   await pool.query(
     `UPDATE maxoptra_export_queue
@@ -1090,10 +1068,7 @@ app.post(
     }
 
     try {
-      const { orders, errors } = await prepareOrders(
-        orderIds,
-        request.shopifySession.shop
-      );
+      const { orders, errors } = await prepareOrders(orderIds);
 
       return {
         preview: true,
@@ -1139,10 +1114,7 @@ app.post(
     }
 
     try {
-      const { orders, errors } = await prepareOrders(
-        orderIds,
-        request.shopifySession.shop
-      );
+      const { orders, errors } = await prepareOrders(orderIds);
       const result = await queueOrders(orders, request.shopifySession);
 
       return {
