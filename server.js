@@ -555,6 +555,49 @@ function maxOptraHeaders() {
   };
 }
 
+function maxOptraOrderDate(routeCode) {
+  const configuredDate = text(process.env.MAXOPTRA_ORDER_DATE);
+
+  if (configuredDate) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(configuredDate)) {
+      throw new Error("MAXOPTRA_ORDER_DATE must use YYYY-MM-DD format");
+    }
+
+    return configuredDate;
+  }
+
+  const routeDays = {
+    SU: 0,
+    MO: 1,
+    TU: 2,
+    WE: 3,
+    TH: 4,
+    FR: 5,
+    SA: 6
+  };
+  const routePrefix = upper(routeCode).slice(0, 2);
+  const targetDay = routeDays[routePrefix];
+
+  if (targetDay == null) {
+    throw new Error(`Cannot derive an order date from route ${routeCode}`);
+  }
+
+  const londonParts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const part = (type) => Number(
+    londonParts.find((item) => item.type === type)?.value
+  );
+  const date = new Date(Date.UTC(part("year"), part("month") - 1, part("day")));
+  const daysAhead = (targetDay - date.getUTCDay() + 7) % 7;
+
+  date.setUTCDate(date.getUTCDate() + daysAhead);
+  return date.toISOString().slice(0, 10);
+}
+
 function maxOptraOrderPayload(row) {
   const contactPerson = [row.first_name, row.customer_location_name]
     .filter(Boolean)
@@ -566,6 +609,7 @@ function maxOptraOrderPayload(row) {
     distributionCentreReference: row.distribution_centre_reference,
     task: "DELIVERY",
     priority: "NORMAL",
+    orderDate: maxOptraOrderDate(row.territory),
     clientName: row.customer_location_name || contactPerson || row.order_reference,
     contactPerson: contactPerson || row.customer_location_name || undefined,
     contactNumber: row.contact_number || undefined,
