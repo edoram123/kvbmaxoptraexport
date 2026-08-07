@@ -11,7 +11,10 @@ const { Pool } = pg;
 const SHOPIFY_API_VERSION = "2026-07";
 const ROUTE_METAFIELD_NAMESPACE = "kvb";
 const ROUTE_METAFIELD_KEY = "fulfilment_route";
+const VAN_METAFIELD_NAMESPACE = "kvb";
+const VAN_METAFIELD_KEY = "van_number";
 const SHOPIFY_BATCH_SIZE = 50;
+const SHOPIFY_METAFIELDS_SET_BATCH_SIZE = 25;
 const PREVIEW_LIMIT = 1000;
 const CSV_COLUMNS = [
   "orderReference",
@@ -888,6 +891,427 @@ async function processExport(row) {
   });
 }
 
+function validShiftDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return false;
+  }
+
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+async function fetchMaxOptraSchedule(shiftDate) {
+  const distributionCentreReference =
+    process.env.MAXOPTRA_DISTRIBUTION_CENTRE_REFERENCE;
+  const response = await fetch(
+    maxOptraUrl(
+      `/schedules/dc/${encodeURIComponent(distributionCentreReference)}/${shiftDate}`
+    ),
+    {
+      method: "GET",
+      headers: maxOptraHeaders(),
+      signal: AbortSignal.timeout(30000)
+    }
+  );
+
+  return {
+    response,
+    body: await responseBody(response)
+  };
+}
+
+function scheduleAllocations(body) {
+  const driverShifts = Array.isArray(body?.driverShifts)
+    ? body.driverShifts
+    : Array.isArray(body?.data?.driverShifts)
+      ? body.data.driverShifts
+      : [];
+  const allocations = new Map();
+
+  for (const shift of driverShifts) {
+    const vehicleName = text(shift?.vehicleName);
+
+    for (const run of Array.isArray(shift?.runs) ? shift.runs : []) {
+      for (const allocation of Array.isArray(run?.allocations) ? run.allocations : []) {
+        const orderReference = text(allocation?.orderReference);
+        if (!orderReference) continue;
+
+        const current = allocations.get(orderReference);
+
+        if (current) {
+          if (current.vehicle_name !== vehicleName) {
+            current.conflict = true;
+            current.last_error =
+              `MaxOptra returned more than one vehicle for ${orderReference}`;
+          }
+          continue;
+        }
+
+        allocations.set(orderReference, {
+          maxoptra_order_reference: orderReference,
+          vehicle_name: vehicleName,
+          conflict: false,
+          last_error: null
+        });
+      }
+    }
+  }
+
+  return Array.from(allocations.values());
+}
+
+async function loadExportMembers(shop, orderReferences) {
+  if (!orderReferences.length) return new Map();
+
+  const result = await pool.query(
+    `WITH latest_queue AS (
+       SELECT DISTINCT ON (order_reference)
+         id,
+         order_reference
+       FROM maxoptra_export_queue
+       WHERE shop_domain = $1
+         AND order_reference = ANY($2::text[])
+         AND status IN ('confirmed', 'sent', 'already_present')
+       ORDER BY order_reference, id DESC
+     )
+     SELECT
+       latest_queue.id AS queue_id,
+       latest_queue.order_reference AS maxoptra_order_reference,
+       member.shopify_order_id,
+       member.shopify_order_numeric_id,
+       member.shopify_order_reference
+     FROM latest_queue
+     JOIN maxoptra_export_members AS member
+       ON member.queue_id = latest_queue.id
+     ORDER BY latest_queue.id, member.id`,
+    [shop, orderReferences]
+  );
+  const members = new Map();
+
+  for (const row of result.rows) {
+    if (!members.has(row.maxoptra_order_reference)) {
+      members.set(row.maxoptra_order_reference, []);
+    }
+    members.get(row.maxoptra_order_reference).push(row);
+  }
+
+  return members;
+}
+
+async function fetchCurrentVanNumbers(orderIds) {
+  const orders = new Map();
+
+  for (const idBatch of chunks(orderIds, SHOPIFY_BATCH_SIZE)) {
+    const data = await shopifyGraphql(
+      `query CurrentVanNumbers($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on Order {
+            id
+            name
+            vanNumber: metafield(
+              namespace: "${VAN_METAFIELD_NAMESPACE}"
+              key: "${VAN_METAFIELD_KEY}"
+            ) {
+              value
+              compareDigest
+            }
+          }
+        }
+      }`,
+      { ids: idBatch }
+    );
+
+    for (const order of data.nodes.filter(Boolean)) {
+      orders.set(order.id, {
+        order_name: order.name,
+        value: text(order.vanNumber?.value),
+        compare_digest: order.vanNumber?.compareDigest ?? null
+      });
+    }
+  }
+
+  return orders;
+}
+
+async function writeVanNumberBatch(targets) {
+  const data = await shopifyGraphql(
+    `mutation SetOrderVanNumbers($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields {
+          id
+          value
+        }
+        userErrors {
+          field
+          message
+          code
+        }
+      }
+    }`,
+    {
+      metafields: targets.map((target) => ({
+        ownerId: target.shopify_order_id,
+        namespace: VAN_METAFIELD_NAMESPACE,
+        key: VAN_METAFIELD_KEY,
+        type: "single_line_text_field",
+        value: target.van_number,
+        compareDigest: target.compare_digest
+      }))
+    }
+  );
+  const payload = data.metafieldsSet;
+
+  if (payload.userErrors.length) {
+    throw new Error(
+      payload.userErrors.map((error) => error.message).join("; ")
+    );
+  }
+}
+
+async function saveVehicleAssignmentLogs(records) {
+  if (!records.length) return;
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    for (const record of records) {
+      await client.query(
+        `INSERT INTO maxoptra_vehicle_assignment_log (
+           import_batch_id,
+           queue_id,
+           shop_domain,
+           shift_date,
+           distribution_centre_reference,
+           maxoptra_order_reference,
+           shopify_order_id,
+           shopify_order_numeric_id,
+           shopify_order_reference,
+           previous_van_number,
+           van_number,
+           assignment_result,
+           requested_by_shopify_user_id,
+           shopify_confirmed_at,
+           last_error
+         ) VALUES (
+           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+           $11, $12, $13,
+           CASE WHEN $14 THEN NOW() ELSE NULL END,
+           $15
+         )`,
+        [
+          record.import_batch_id,
+          record.queue_id || null,
+          record.shop_domain,
+          record.shift_date,
+          record.distribution_centre_reference,
+          record.maxoptra_order_reference,
+          record.shopify_order_id || null,
+          record.shopify_order_numeric_id || null,
+          record.shopify_order_reference || null,
+          record.previous_van_number || null,
+          record.van_number || null,
+          record.assignment_result,
+          record.requested_by_shopify_user_id || null,
+          Boolean(record.shopify_confirmed),
+          record.last_error || null
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function vehicleImportCounts(records) {
+  const counts = {
+    written: 0,
+    overwritten: 0,
+    already_present: 0,
+    unmapped: 0,
+    unassigned: 0,
+    failed: 0
+  };
+
+  for (const record of records) {
+    if (Object.hasOwn(counts, record.assignment_result)) {
+      counts[record.assignment_result] += 1;
+    }
+  }
+
+  return counts;
+}
+
+async function importVehicleAssignments(shiftDate, session) {
+  const schedule = await fetchMaxOptraSchedule(shiftDate);
+
+  if (!schedule.response.ok) {
+    throw new Error(
+      `MaxOptra schedule request failed with HTTP ${schedule.response.status}`
+    );
+  }
+
+  const allocations = scheduleAllocations(schedule.body);
+  const membersByReference = await loadExportMembers(
+    session.shop,
+    allocations.map((allocation) => allocation.maxoptra_order_reference)
+  );
+  const batchId = randomUUID();
+  const distributionCentreReference =
+    process.env.MAXOPTRA_DISTRIBUTION_CENTRE_REFERENCE;
+  const common = {
+    import_batch_id: batchId,
+    shop_domain: session.shop,
+    shift_date: shiftDate,
+    distribution_centre_reference: distributionCentreReference,
+    requested_by_shopify_user_id: session.userId
+  };
+  const records = [];
+  const targets = [];
+  const targetByOrderId = new Map();
+
+  for (const allocation of allocations) {
+    const members = membersByReference.get(
+      allocation.maxoptra_order_reference
+    );
+
+    if (allocation.conflict) {
+      records.push({
+        ...common,
+        maxoptra_order_reference: allocation.maxoptra_order_reference,
+        van_number: allocation.vehicle_name,
+        assignment_result: "failed",
+        last_error: allocation.last_error
+      });
+      continue;
+    }
+
+    if (!allocation.vehicle_name) {
+      records.push({
+        ...common,
+        maxoptra_order_reference: allocation.maxoptra_order_reference,
+        assignment_result: "unassigned",
+        last_error: "MaxOptra has not assigned a vehicle name"
+      });
+      continue;
+    }
+
+    if (!members?.length) {
+      records.push({
+        ...common,
+        maxoptra_order_reference: allocation.maxoptra_order_reference,
+        van_number: allocation.vehicle_name,
+        assignment_result: "unmapped",
+        last_error: "No matching confirmed MaxOptra export was found"
+      });
+      continue;
+    }
+
+    for (const member of members) {
+      const existingTarget = targetByOrderId.get(member.shopify_order_id);
+
+      if (existingTarget && existingTarget.van_number !== allocation.vehicle_name) {
+        records.push({
+          ...common,
+          ...member,
+          maxoptra_order_reference: allocation.maxoptra_order_reference,
+          van_number: allocation.vehicle_name,
+          assignment_result: "failed",
+          last_error: "Shopify order was allocated to conflicting vehicles"
+        });
+        continue;
+      }
+
+      if (!existingTarget) {
+        const target = {
+          ...common,
+          ...member,
+          maxoptra_order_reference: allocation.maxoptra_order_reference,
+          van_number: allocation.vehicle_name
+        };
+        targetByOrderId.set(member.shopify_order_id, target);
+        targets.push(target);
+      }
+    }
+  }
+
+  const currentOrders = await fetchCurrentVanNumbers(
+    targets.map((target) => target.shopify_order_id)
+  );
+  const writeTargets = [];
+
+  for (const target of targets) {
+    const current = currentOrders.get(target.shopify_order_id);
+
+    if (!current) {
+      records.push({
+        ...target,
+        assignment_result: "failed",
+        last_error: "Shopify order could not be found"
+      });
+      continue;
+    }
+
+    target.shopify_order_reference =
+      target.shopify_order_reference || current.order_name;
+    target.previous_van_number = current.value;
+    target.compare_digest = current.compare_digest;
+
+    if (current.value === target.van_number) {
+      records.push({
+        ...target,
+        assignment_result: "already_present",
+        shopify_confirmed: true
+      });
+    } else {
+      writeTargets.push(target);
+    }
+  }
+
+  for (const targetBatch of chunks(
+    writeTargets,
+    SHOPIFY_METAFIELDS_SET_BATCH_SIZE
+  )) {
+    try {
+      await writeVanNumberBatch(targetBatch);
+
+      for (const target of targetBatch) {
+        records.push({
+          ...target,
+          assignment_result: target.previous_van_number
+            ? "overwritten"
+            : "written",
+          shopify_confirmed: true
+        });
+      }
+    } catch (error) {
+      for (const target of targetBatch) {
+        records.push({
+          ...target,
+          assignment_result: "failed",
+          last_error: error.message
+        });
+      }
+    }
+  }
+
+  await saveVehicleAssignmentLogs(records);
+
+  return {
+    import_batch_id: batchId,
+    shift_date: shiftDate,
+    schedule_allocations: allocations.length,
+    shopify_orders_matched: targets.length,
+    ...vehicleImportCounts(records)
+  };
+}
+
 async function runExportWorker() {
   if (exportWorkerBusy || !maxOptraSettings().sendEnabled) {
     return;
@@ -1139,6 +1563,42 @@ app.post(
     } catch (error) {
       request.log.error(error, "Unable to queue MaxOptra export");
       return reply.code(500).send({ error: "Unable to queue MaxOptra export" });
+    }
+  }
+);
+
+app.post(
+  "/api/vehicle-assignments/import",
+  { preHandler: requireShopifySession },
+  async (request, reply) => {
+    const shiftDate = request.body?.shift_date;
+
+    if (!validShiftDate(shiftDate)) {
+      return reply.code(400).send({
+        error: "shift_date must be a valid date in YYYY-MM-DD format"
+      });
+    }
+
+    if (!maxOptraSettings().configured) {
+      return reply.code(503).send({ error: "MaxOptra is not configured" });
+    }
+
+    if (!process.env.MAXOPTRA_DISTRIBUTION_CENTRE_REFERENCE) {
+      return reply.code(503).send({
+        error: "MAXOPTRA_DISTRIBUTION_CENTRE_REFERENCE is not configured"
+      });
+    }
+
+    try {
+      return await importVehicleAssignments(
+        shiftDate,
+        request.shopifySession
+      );
+    } catch (error) {
+      request.log.error(error, "Unable to import MaxOptra vehicle assignments");
+      return reply.code(502).send({
+        error: error.message || "Unable to import MaxOptra vehicle assignments"
+      });
     }
   }
 );
