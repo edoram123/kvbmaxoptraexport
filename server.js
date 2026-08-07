@@ -571,6 +571,8 @@ function maxOptraOrderPayload(row) {
     contactNumber: row.contact_number || undefined,
     contactEmail: row.contact_email || undefined,
     customerLocation: {
+      referenceNumber:
+        row.unique_reference || row.customer_id || row.order_reference,
       name: row.customer_location_name || contactPerson || row.order_reference,
       address: row.customer_location_address
     }
