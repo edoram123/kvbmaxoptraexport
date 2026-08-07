@@ -420,7 +420,7 @@ async function queueOrders(orders, session) {
 
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        [hash]
+        [`${session.shop}:${order.order_id}`]
       );
 
       const existing = await client.query(
@@ -428,13 +428,10 @@ async function queueOrders(orders, session) {
          FROM maxoptra_export_queue
          WHERE shop_domain = $1
            AND shopify_order_id = $2
-           AND payload_hash = $3
-           AND status IN (
-             'pending', 'processing', 'sent', 'confirmed', 'already_present'
-           )
+           AND status IN ('pending', 'processing')
          ORDER BY id DESC
          LIMIT 1`,
-        [session.shop, order.order_id, hash]
+        [session.shop, order.order_id]
       );
 
       if (existing.rowCount) {
@@ -712,55 +709,61 @@ async function processExport(row) {
     [row.id, JSON.stringify(payload)]
   );
 
-  const createResponse = await fetch(maxOptraUrl("/orders"), {
-    method: "POST",
-    headers: maxOptraHeaders(),
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(30000)
-  });
-  const createBody = await responseBody(createResponse);
-  const duplicate = createResponse.status === 409;
+  const existing = await fetchMaxOptraOrder(row.order_reference);
 
-  if (!createResponse.ok && !duplicate) {
+  if (!existing.response.ok && existing.response.status !== 404) {
     await saveExportResult(row.id, {
       status: "failed",
       payload,
-      httpStatus: createResponse.status,
-      response: createBody,
-      error: `MaxOptra rejected the order with HTTP ${createResponse.status}`,
+      httpStatus: existing.response.status,
+      response: { lookup: existing.body },
+      error: `Unable to check MaxOptra order; HTTP ${existing.response.status}`,
       completed: true
     });
     return;
   }
 
-  const lookup = await fetchMaxOptraOrder(row.order_reference);
+  const updating = existing.response.ok;
+  const writeResponse = await fetch(
+    updating
+      ? maxOptraUrl(`/orders/${encodeURIComponent(row.order_reference)}`)
+      : maxOptraUrl("/orders"),
+    {
+    method: updating ? "PUT" : "POST",
+    headers: maxOptraHeaders(),
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30000)
+    }
+  );
+  const writeBody = await responseBody(writeResponse);
 
-  if (!lookup.response.ok) {
+  if (!writeResponse.ok) {
     await saveExportResult(row.id, {
-      status: "sent",
+      status: "failed",
       payload,
-      httpStatus: createResponse.status,
+      httpStatus: writeResponse.status,
       response: {
-        create: createBody,
-        verification: lookup.body
+        operation: updating ? "update" : "create",
+        lookup: existing.body,
+        write: writeBody
       },
-      error: `Order was sent but verification failed with HTTP ${lookup.response.status}`,
-      sent: !duplicate,
+      error: `MaxOptra rejected the ${updating ? "update" : "order"} with HTTP ${writeResponse.status}`,
       completed: true
     });
     return;
   }
 
   await saveExportResult(row.id, {
-    status: duplicate ? "already_present" : "confirmed",
+    status: "confirmed",
     payload,
-    httpStatus: createResponse.status,
+    httpStatus: writeResponse.status,
     response: {
-      create: createBody,
-      verification: lookup.body
+      operation: updating ? "update" : "create",
+      lookup: existing.body,
+      write: writeBody
     },
     error: null,
-    sent: !duplicate,
+    sent: true,
     confirmed: true,
     completed: true
   });
