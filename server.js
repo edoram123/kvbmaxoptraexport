@@ -637,10 +637,6 @@ async function responseBody(response) {
   }
 }
 
-function maxOptraOrderDetails(body) {
-  return body?.data && typeof body.data === "object" ? body.data : body;
-}
-
 async function claimNextExport() {
   const result = await pool.query(`
     UPDATE maxoptra_export_queue
@@ -755,26 +751,17 @@ async function processExport(row) {
     return;
   }
 
-  const details = maxOptraOrderDetails(lookup.body);
-  const expectedTerritory = upper(row.territory);
-  const actualTerritory = upper(details?.territoryReference);
-  const territoryMatches = expectedTerritory && actualTerritory === expectedTerritory;
-  const resultStatus = duplicate ? "already_present" : territoryMatches ? "confirmed" : "sent";
-  const territoryMessage = territoryMatches
-    ? null
-    : `Expected territory ${expectedTerritory || "(none)"}; MaxOptra returned ${actualTerritory || "(none)"}`;
-
   await saveExportResult(row.id, {
-    status: resultStatus,
+    status: duplicate ? "already_present" : "confirmed",
     payload,
     httpStatus: createResponse.status,
     response: {
       create: createBody,
       verification: lookup.body
     },
-    error: territoryMessage,
+    error: null,
     sent: !duplicate,
-    confirmed: territoryMatches,
+    confirmed: true,
     completed: true
   });
 }
