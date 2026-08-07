@@ -1033,6 +1033,114 @@ async function fetchCurrentVanNumbers(orderIds) {
   return orders;
 }
 
+async function fetchVehicleAssignmentOrderDetails(orderIds) {
+  const orders = new Map();
+
+  for (const idBatch of chunks(orderIds, SHOPIFY_BATCH_SIZE)) {
+    const data = await shopifyGraphql(
+      `query VehicleAssignmentOrderDetails($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on Order {
+            id
+            name
+            customer {
+              id
+              legacyResourceId
+              firstName
+              lastName
+            }
+          }
+        }
+      }`,
+      { ids: idBatch }
+    );
+
+    for (const order of data.nodes.filter(Boolean)) {
+      orders.set(order.id, {
+        order_name: order.name,
+        customer_id: order.customer
+          ? String(
+            order.customer.legacyResourceId ||
+            numericShopifyId(order.customer.id) ||
+            ""
+          ) || null
+          : null,
+        customer_name: order.customer
+          ? [order.customer.firstName, order.customer.lastName]
+            .filter(Boolean)
+            .join(" ")
+            .trim()
+          : ""
+      });
+    }
+  }
+
+  return orders;
+}
+
+async function listVehicleAssignments(shiftDate, shop) {
+  const result = await pool.query(
+    `SELECT DISTINCT ON (log.shopify_order_id)
+       log.id,
+       log.queue_id,
+       log.shopify_order_id,
+       log.shopify_order_numeric_id,
+       log.shopify_order_reference,
+       log.maxoptra_order_reference,
+       log.van_number,
+       log.assignment_result,
+       log.imported_at,
+       log.shopify_confirmed_at,
+       member.customer_id
+     FROM maxoptra_vehicle_assignment_log AS log
+     LEFT JOIN maxoptra_export_members AS member
+       ON member.queue_id = log.queue_id
+      AND member.shopify_order_id = log.shopify_order_id
+     WHERE log.shop_domain = $1
+       AND log.shift_date = $2
+       AND log.shopify_order_id IS NOT NULL
+       AND log.assignment_result IN (
+         'written',
+         'overwritten',
+         'already_present'
+       )
+     ORDER BY
+       log.shopify_order_id,
+       log.imported_at DESC,
+       log.id DESC`,
+    [shop, shiftDate]
+  );
+  const details = await fetchVehicleAssignmentOrderDetails(
+    result.rows.map((row) => row.shopify_order_id)
+  );
+
+  return result.rows.map((row) => {
+    const order = details.get(row.shopify_order_id) || {};
+    const customerId = order.customer_id || row.customer_id || null;
+    const orderNumericId =
+      row.shopify_order_numeric_id || numericShopifyId(row.shopify_order_id);
+
+    return {
+      customer_id: customerId,
+      customer_name: order.customer_name || "",
+      customer_admin_url: customerId
+        ? `https://${shop}/admin/customers/${customerId}`
+        : null,
+      order_id: row.shopify_order_id,
+      order_numeric_id: orderNumericId,
+      order_name: order.order_name || row.shopify_order_reference,
+      order_admin_url: orderNumericId
+        ? `https://${shop}/admin/orders/${orderNumericId}`
+        : null,
+      maxoptra_order_reference: row.maxoptra_order_reference,
+      van_number: row.van_number,
+      assignment_result: row.assignment_result,
+      imported_at: row.imported_at,
+      shopify_confirmed_at: row.shopify_confirmed_at
+    };
+  });
+}
+
 async function writeVanNumberBatch(targets) {
   const data = await shopifyGraphql(
     `mutation SetOrderVanNumbers($metafields: [MetafieldsSetInput!]!) {
@@ -1598,6 +1706,32 @@ app.post(
       request.log.error(error, "Unable to import MaxOptra vehicle assignments");
       return reply.code(502).send({
         error: error.message || "Unable to import MaxOptra vehicle assignments"
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/vehicle-assignments",
+  { preHandler: requireShopifySession },
+  async (request, reply) => {
+    const shiftDate = request.query?.shift_date;
+
+    if (!validShiftDate(shiftDate)) {
+      return reply.code(400).send({
+        error: "shift_date must be a valid date in YYYY-MM-DD format"
+      });
+    }
+
+    try {
+      return await listVehicleAssignments(
+        shiftDate,
+        request.shopifySession.shop
+      );
+    } catch (error) {
+      request.log.error(error, "Unable to list imported van assignments");
+      return reply.code(502).send({
+        error: "Unable to list imported van assignments"
       });
     }
   }
